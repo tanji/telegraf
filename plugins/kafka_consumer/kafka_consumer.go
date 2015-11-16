@@ -1,9 +1,8 @@
 package kafka_consumer
 
 import (
-	"os"
-	"os/signal"
-	"time"
+	"log"
+	"sync"
 
 	"github.com/Shopify/sarama"
 	"github.com/influxdb/influxdb/models"
@@ -12,25 +11,32 @@ import (
 )
 
 type Kafka struct {
-	ConsumerGroupName string
-	Topic             string
-	ZookeeperPeers    []string
-	Consumer          *consumergroup.ConsumerGroup
-	BatchSize         int
+	ConsumerGroup  string
+	Topics         []string
+	ZookeeperPeers []string
+	Consumer       *consumergroup.ConsumerGroup
+	MetricBuffer   int
+
+	sync.Mutex
+
+	// channel for all incoming kafka messages
+	in <-chan *sarama.ConsumerMessage
+	// channel for all kafka consumer errors
+	errs <-chan *sarama.ConsumerError
+	// channel for all incoming parsed kafka points
+	pointChan chan models.Point
+	done      chan struct{}
 }
 
 var sampleConfig = `
-  # topic to consume
-  topic = "topic_with_metrics"
-
-  # the name of the consumer group
-  consumerGroupName = "telegraf_metrics_consumers"
-
+  # topic(s) to consume
+  topics = ["telegraf"]
   # an array of Zookeeper connection strings
-  zookeeperPeers = ["localhost:2181"]
-
-  # Batch size of points sent to InfluxDB
-  batchSize = 1000
+  zookeeper_peers = ["localhost:2181"]
+  # the name of the consumer group
+  consumer_group = "telegraf_metrics_consumers"
+  # Maximum number of points to buffer between collection intervals
+  metric_buffer = 100000
 `
 
 func (k *Kafka) SampleConfig() string {
@@ -38,127 +44,89 @@ func (k *Kafka) SampleConfig() string {
 }
 
 func (k *Kafka) Description() string {
-	return "read metrics from a Kafka topic"
+	return "Read line-protocol metrics from Kafka topic(s)"
 }
 
-type Metric struct {
-	Measurement string                 `json:"measurement"`
-	Values      map[string]interface{} `json:"values"`
-	Tags        map[string]string      `json:"tags"`
-	Time        time.Time              `json:"time"`
-}
-
-func (k *Kafka) Gather(acc plugins.Accumulator) error {
+func (k *Kafka) Start() error {
+	k.Lock()
+	defer k.Unlock()
 	var consumerErr error
-	metricQueue := make(chan []byte, 200)
 
-	if k.Consumer == nil {
+	if k.Consumer == nil || k.Consumer.Closed() {
 		k.Consumer, consumerErr = consumergroup.JoinConsumerGroup(
-			k.ConsumerGroupName,
-			[]string{k.Topic},
+			k.ConsumerGroup,
+			k.Topics,
 			k.ZookeeperPeers,
 			nil,
 		)
-
 		if consumerErr != nil {
 			return consumerErr
 		}
 
-		c := make(chan os.Signal, 1)
-		halt := make(chan bool, 1)
-		signal.Notify(c, os.Interrupt)
-		go func() {
-			<-c
-			halt <- true
-			emitMetrics(k, acc, metricQueue)
-			k.Consumer.Close()
-		}()
-
-		go readFromKafka(k.Consumer.Messages(),
-			metricQueue,
-			k.BatchSize,
-			k.Consumer.CommitUpto,
-			halt)
+		// Setup message and error channels
+		k.in = k.Consumer.Messages()
+		k.errs = k.Consumer.Errors()
 	}
 
-	return emitMetrics(k, acc, metricQueue)
+	k.done = make(chan struct{})
+	k.pointChan = make(chan models.Point, k.MetricBuffer)
+
+	// Start the kafka message reader
+	go k.parser()
+	return nil
 }
 
-func emitMetrics(k *Kafka, acc plugins.Accumulator, metricConsumer <-chan []byte) error {
-	timeout := time.After(1 * time.Second)
-
+// parser() reads all incoming messages from the consumer, and parses them into
+// influxdb metric points.
+func (k *Kafka) parser() {
 	for {
 		select {
-		case batch := <-metricConsumer:
-			var points []models.Point
-			var err error
-			if points, err = models.ParsePoints(batch); err != nil {
-				return err
+		case <-k.done:
+			return
+		case err := <-k.errs:
+			log.Printf("Kafka Consumer Error: %s\n", err.Error())
+		case msg := <-k.in:
+			points, err := models.ParsePoints(msg.Value)
+			if err != nil {
+				log.Printf("Could not parse kafka message: %s, error: %s",
+					string(msg.Value), err.Error())
 			}
 
 			for _, point := range points {
-				acc.AddFields(point.Name(), point.Fields(), point.Tags(), point.Time())
+				select {
+				case k.pointChan <- point:
+					continue
+				default:
+					log.Printf("Kafka Consumer buffer is full, dropping a point." +
+						" You may want to increase the message_buffer setting")
+				}
 			}
-		case <-timeout:
-			return nil
+
+			k.Consumer.CommitUpto(msg)
 		}
 	}
 }
 
-const millisecond = 1000000 * time.Nanosecond
-
-type ack func(*sarama.ConsumerMessage) error
-
-func readFromKafka(
-	kafkaMsgs <-chan *sarama.ConsumerMessage,
-	metricProducer chan<- []byte,
-	maxBatchSize int,
-	ackMsg ack,
-	halt <-chan bool,
-) {
-	batch := make([]byte, 0)
-	currentBatchSize := 0
-	timeout := time.After(500 * millisecond)
-	var msg *sarama.ConsumerMessage
-
-	for {
-		select {
-		case msg = <-kafkaMsgs:
-			if currentBatchSize != 0 {
-				batch = append(batch, '\n')
-			}
-
-			batch = append(batch, msg.Value...)
-			currentBatchSize++
-
-			if currentBatchSize == maxBatchSize {
-				metricProducer <- batch
-				currentBatchSize = 0
-				batch = make([]byte, 0)
-				ackMsg(msg)
-			}
-		case <-timeout:
-			if currentBatchSize != 0 {
-				metricProducer <- batch
-				currentBatchSize = 0
-				batch = make([]byte, 0)
-				ackMsg(msg)
-			}
-
-			timeout = time.After(500 * millisecond)
-		case <-halt:
-			if currentBatchSize != 0 {
-				metricProducer <- batch
-				ackMsg(msg)
-			}
-
-			return
-		}
+func (k *Kafka) Stop() {
+	k.Lock()
+	defer k.Unlock()
+	close(k.done)
+	if err := k.Consumer.Close(); err != nil {
+		log.Printf("Error closing kafka consumer: %s\n", err.Error())
 	}
+}
+
+func (k *Kafka) Gather(acc plugins.Accumulator) error {
+	k.Lock()
+	defer k.Unlock()
+	for point := range k.pointChan {
+		acc.AddFields(point.Name(), point.Fields(), point.Tags(), point.Time())
+	}
+	return nil
 }
 
 func init() {
-	plugins.Add("kafka", func() plugins.Plugin {
+	plugins.Add("kafka_consumer", func() plugins.Plugin {
 		return &Kafka{}
 	})
 }
