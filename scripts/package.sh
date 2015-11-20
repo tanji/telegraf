@@ -133,8 +133,8 @@ do_build() {
     for b in ${BINS[*]}; do
         rm -f $GOPATH_INSTALL/bin/$b
     done
-
-    godep go install -ldflags="-X main.Version $version" ./...
+    
+    godep go install -ldflags="-X main.Version $version" ./cmd/telegraf/telegraf.go
     if [ $? -ne 0 ]; then
         echo "Build failed, unable to create package -- aborting"
         cleanup_exit 1

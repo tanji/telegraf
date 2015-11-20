@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"time"
+	"strconv"
 )
 
 type Mysql struct {
@@ -120,9 +121,13 @@ func (m *Mysql) gatherServer(serv string, acc plugins.Accumulator) error {
 
 	// Formula computation goes here
 
-	maxConn, err := getVariableByName(db, "max_connections")
+	val, err := getVariableByName(db, "max_connections")
 	if err != nil {
 		return err
+	}
+	maxConn, ok := val.(uint)
+	if !ok {
+		return "Error parsing max_connections"
 	}
 
 	acc.Add("connections_max_reached_ratio", statusVars["max_used_connections"]/maxConn, tags)
