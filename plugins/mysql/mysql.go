@@ -2,15 +2,17 @@ package mysql
 
 import (
 	"database/sql"
-	"strconv"
-	"strings"
-
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/influxdb/telegraf/plugins"
+	"log"
+	"strings"
+	"time"
 )
 
 type Mysql struct {
-	Servers []string
+	Servers        []string
+	LastStatus     map[string]uint
+	LastSampleTime time.Time
 }
 
 var sampleConfig = `
@@ -53,66 +55,6 @@ func (m *Mysql) Gather(acc plugins.Accumulator) error {
 	return nil
 }
 
-type mapping struct {
-	onServer string
-	inExport string
-}
-
-var mappings = []*mapping{
-	{
-		onServer: "Aborted_",
-		inExport: "aborted_",
-	},
-	{
-		onServer: "Bytes_",
-		inExport: "bytes_",
-	},
-	{
-		onServer: "Com_",
-		inExport: "commands_",
-	},
-	{
-		onServer: "Created_",
-		inExport: "created_",
-	},
-	{
-		onServer: "Handler_",
-		inExport: "handler_",
-	},
-	{
-		onServer: "Innodb_",
-		inExport: "innodb_",
-	},
-	{
-		onServer: "Key_",
-		inExport: "key_",
-	},
-	{
-		onServer: "Open_",
-		inExport: "open_",
-	},
-	{
-		onServer: "Opened_",
-		inExport: "opened_",
-	},
-	{
-		onServer: "Qcache_",
-		inExport: "qcache_",
-	},
-	{
-		onServer: "Table_",
-		inExport: "table_",
-	},
-	{
-		onServer: "Tokudb_",
-		inExport: "tokudb_",
-	},
-	{
-		onServer: "Threads_",
-		inExport: "threads_",
-	},
-}
-
 func (m *Mysql) gatherServer(serv string, acc plugins.Accumulator) error {
 	// If user forgot the '/', add it
 	if strings.HasSuffix(serv, ")") {
@@ -126,9 +68,16 @@ func (m *Mysql) gatherServer(serv string, acc plugins.Accumulator) error {
 		return err
 	}
 
-	defer db.Close()
+	statusVars := make(map[string]uint)
+	sampleTime := time.Now()
 
-	rows, err := db.Query(`SHOW /*!50002 GLOBAL */ STATUS`)
+	defer func() {
+		m.LastStatus = statusVars
+		m.LastSampleTime = sampleTime
+		db.Close()
+	}()
+
+	rows, err := db.Query("SELECT LOWER(VARIABLE_NAME) AS name, VARIABLE_VALUE AS val FROM INFORMATION_SCHEMA.GLOBAL_STATUS")
 	if err != nil {
 		return err
 	}
@@ -138,48 +87,59 @@ func (m *Mysql) gatherServer(serv string, acc plugins.Accumulator) error {
 	if err != nil {
 		servtag = "localhost"
 	}
+	tags := map[string]string{"server": servtag}
+
 	for rows.Next() {
 		var name string
-		var val interface{}
+		var val uint
 
 		err = rows.Scan(&name, &val)
 		if err != nil {
-			return err
+			log.Printf("Could not parse variable %s as integer\n", name)
 		}
 
-		var found bool
+		statusVars[name] = val
+	}
 
-		tags := map[string]string{"server": servtag}
-
-		for _, mapped := range mappings {
-			if strings.HasPrefix(name, mapped.onServer) {
-				i, _ := strconv.Atoi(string(val.([]byte)))
-				acc.Add(mapped.inExport+name[len(mapped.onServer):], i, tags)
-				found = true
+	if m.LastStatus != nil && statusVars != nil {
+		sampleDelta := sampleTime.Sub(m.LastSampleTime).Seconds()
+		for k, v := range statusVars {
+			for _, e := range MysqlCounterKeys {
+				if e == k {
+					i := diff(statusVars[k], m.LastStatus[k], uint(sampleDelta))
+					acc.Add(k, i, tags)
+				}
 			}
-		}
-
-		if found {
-			continue
-		}
-
-		switch name {
-		case "Queries":
-			i, err := strconv.ParseInt(string(val.([]byte)), 10, 64)
-			if err != nil {
-				return err
+			for _, e := range MysqlGaugeKeys {
+				if e == k {
+					acc.Add(k, v, tags)
+				}
 			}
-
-			acc.Add("queries", i, tags)
-		case "Slow_queries":
-			i, err := strconv.ParseInt(string(val.([]byte)), 10, 64)
-			if err != nil {
-				return err
-			}
-
-			acc.Add("slow_queries", i, tags)
 		}
 	}
+
+	// Formula computation goes here
+
+	maxConn, err := getVariableByName(db, "max_connections")
+	if err != nil {
+		return err
+	}
+
+	acc.Add("connections_max_reached_ratio", statusVars["max_used_connections"]/maxConn, tags)
+
+	acc.Add("connections_refused_ratio", statusVars["aborted_connects"]/maxConn, tags)
+
+	acc.Add("connection_usage", statusVars["threads_connected"]/maxConn, tags)
+
+	acc.Add("innodb_buffer_pool_hit_ratio", statusVars["innodb_buffer_pool_reads"]/statusVars["innodb_buffer_pool_read_requests"], tags)
+
+	acc.Add("thread_cache_hit_ratio", statusVars["threads_created"]/statusVars["connections"])
+
+	acc.Add("table_lock_contention", statusVars["table_locks_waited"]/(statusVars["table_locks_waited"]+statusVars["table_locks_immediate"]), tags)
+
+	acc.Add("qcache_hit_ratio", statusVars["qcache_hits"]/(statusVars["com_select"]+statusVars["qcache_hits"]), tags)
+
+	acc.Add("table_cache_hit_ratio", statusVars["created_tmp_disk_tables"]/statusVars["created_tmp_tables"], tags)
 
 	conn_rows, err := db.Query("SELECT user, sum(1) FROM INFORMATION_SCHEMA.PROCESSLIST GROUP BY user")
 
@@ -197,7 +157,7 @@ func (m *Mysql) gatherServer(serv string, acc plugins.Accumulator) error {
 		if err != nil {
 			return err
 		}
-		acc.Add("connections", connections, tags)
+		acc.Add("connections_per_user", connections, tags)
 	}
 
 	return nil
@@ -207,4 +167,27 @@ func init() {
 	plugins.Add("mysql", func() plugins.Plugin {
 		return &Mysql{}
 	})
+}
+
+func diff(newVal, oldVal, sampleTime uint) uint {
+	d := newVal - oldVal
+	if d < 0 {
+		d = newVal
+	}
+	return d / sampleTime
+}
+
+func getVariableByName(db *sql.DB, name string) (interface{}, error) {
+	var val string
+	row := db.QueryRow("SELECT variable_value FROM information_schema.global_status WHERE variable_name = $1", name)
+	err := row.Scan(&val)
+	if err != nil {
+		return err
+	}
+	intval, err := strconv.ParseUint(val, 10, 64)
+	if err != nil {
+		return val
+	} else {
+		return intval
+	}
 }
